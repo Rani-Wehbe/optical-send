@@ -1,4 +1,4 @@
-name: Deploy Nuxt site to Pages (PNPM, No Artifacts)
+name: Deploy Nuxt site to Pages (pnpm, no artifacts)
 
 on:
   push:
@@ -20,50 +20,29 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Detect package manager
-        id: detect-package-manager
-        run: |
-          if [ -f "pnpm-lock.yaml" ]; then
-            echo "manager=pnpm" >> $GITHUB_OUTPUT
-          elif [ -f "yarn.lock" ]; then
-            echo "manager=yarn" >> $GITHUB_OUTPUT
-          else
-            echo "manager=npm" >> $GITHUB_OUTPUT
-          fi
+      # Install pnpm
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9
 
+      # Setup Node & pnpm 
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
           node-version: 20
-          cache: ${{ steps.detect-package-manager.outputs.manager }}
+          cache: pnpm
 
-      - name: Setup pnpm
-        if: steps.detect-package-manager.outputs.manager == 'pnpm'
-        uses: pnpm/action-setup@v4
-        with:
-          version: latest
-
+      # Install dependencies via pnpm
       - name: Install dependencies
-        run: |
-          if [ "${{ steps.detect-package-manager.outputs.manager }}" = "pnpm" ]; then
-            pnpm install
-          elif [ "${{ steps.detect-package-manager.outputs.manager }}" = "yarn" ]; then
-            yarn install
-          else
-            npm ci
-          fi
+        run: pnpm install --frozen-lockfile
 
-      - name: Build Nuxt
-        run: |
-          if [ "${{ steps.detect-package-manager.outputs.manager }}" = "pnpm" ]; then
-            pnpm generate
-          elif [ "${{ steps.detect-package-manager.outputs.manager }}" = "yarn" ]; then
-            yarn generate
-          else
-            npm run generate
-          fi
+      # Build Nuxt static output
+      - name: Build static site
+        run: pnpm generate
 
-      - name: Deploy to gh-pages (no artifacts)
+      # Deploy dist/ directly to github pages with no artifact upload
+      - name: Deploy to gh-pages
         uses: peaceiris/actions-gh-pages@v3
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
