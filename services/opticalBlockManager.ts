@@ -11,7 +11,8 @@
 import { v4 as uuidv4 } from 'uuid';
 import { computeSHA256 } from './opticalCrypto';
 import { selectBestCompression } from './opticalCompression';
-import { BlockHeader, QRChunkFrame, chunkBlockForQR } from './opticalQR';
+import type { BlockHeader, QRChunkFrame } from './opticalQR';
+import { chunkBlockForQR } from './opticalQR';
 
 export type BlockState =
   | 'pending'
@@ -63,7 +64,12 @@ export async function createBlocksFromFile(
     const blockData = fileData.slice(start, end);
 
     const compressionResult = await selectBestCompression(blockData);
-    const checksum = await computeSHA256(compressionResult.compressed.buffer);
+    // Ensure we pass a proper ArrayBuffer (slice view) to computeSHA256
+    const comp = compressionResult.compressed;
+    // Create a contiguous ArrayBuffer copy to avoid SharedArrayBuffer or offset issues
+    const compCopy = new Uint8Array(comp.byteLength);
+    compCopy.set(comp, 0);
+    const checksum = await computeSHA256(compCopy.buffer);
 
     const header: BlockHeader = {
       protocol: 'opticalsend-v1',
