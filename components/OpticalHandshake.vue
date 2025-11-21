@@ -50,6 +50,14 @@
         <div class="text-xs text-gray-500 mt-3 text-center">
           Session ID: {{ sessionId?.slice(0, 8) }}...
         </div>
+        <div class="mt-4">
+          <label class="block text-sm font-semibold mb-2">Paste receiver response JSON (or camera scan result)</label>
+          <textarea v-model="responseJson" rows="4" class="w-full border rounded p-2 text-xs font-mono" placeholder='{"type":"handshake", "role":"receiver", ...}'></textarea>
+          <div class="flex gap-2 mt-2">
+            <button @click="finalizeHandshake" :disabled="isFinalizing" class="px-4 py-2 bg-green-600 text-white rounded">Finalize Handshake</button>
+            <button @click="() => { responseJson = '' }" class="px-4 py-2 bg-gray-200 rounded">Clear</button>
+          </div>
+        </div>
       </div>
 
       <!-- Status Messages -->
@@ -62,11 +70,12 @@
 
 <script setup lang="ts">
 import { ref, computed } from 'vue';
-import { generateECDHKeyPair, exportPublicKeyBase64 } from '~/services/opticalCrypto';
+import { generateECDHKeyPair, exportPublicKeyBase64, arrayBufferToBase64 } from '~/services/opticalCrypto';
 import { createSenderHandshakeFrame, renderQRToCanvas } from '~/services/opticalQR';
+import { finalizeSenderHandshake } from '~/services/opticalHandshake';
 
 const emit = defineEmits<{
-  'handshake-complete': [pubKey: string, sessionId: string];
+  'handshake-complete': [pubKey: string, sessionId: string, symKeyBase64?: string];
 }>();
 
 const selectedMode = ref<'qr'>('qr');
@@ -94,11 +103,13 @@ const startHandshake = async () => {
 
     // Generate ephemeral ECDH keypair
     const keyPair = await generateECDHKeyPair();
+    senderKeyPair.value = keyPair;
     const pubKeyBase64 = await exportPublicKeyBase64(keyPair.publicKey);
 
     // Create handshake frame
     const frame = createSenderHandshakeFrame(pubKeyBase64);
     sessionId.value = frame.fileSessionId;
+    senderNonceBase64.value = (frame as any).nonce;
 
     handshakeQR.value = JSON.stringify(frame);
     showQR.value = true;
@@ -111,13 +122,51 @@ const startHandshake = async () => {
         'Handshake QR ready! Show this to receiver to scan.';
     }
 
-    // Emit handshake complete event
+    // Emit handshake info (no symmetric key yet)
     emit('handshake-complete', pubKeyBase64, frame.fileSessionId);
   } catch (error) {
     statusMessage.value = `Error: ${String(error)}`;
     console.error('Handshake failed:', error);
   } finally {
     isHandshaking.value = false;
+  }
+};
+
+// Response paste + finalize
+const responseJson = ref('');
+const isFinalizing = ref(false);
+const senderKeyPair = ref<any | null>(null);
+const senderNonceBase64 = ref<string | null>(null);
+
+const finalizeHandshake = async () => {
+  if (!senderKeyPair.value) {
+    statusMessage.value = 'Error: no sender keypair available';
+    return;
+  }
+  if (!responseJson.value) {
+    statusMessage.value = 'Paste receiver response JSON before finalizing';
+    return;
+  }
+
+  try {
+    isFinalizing.value = true;
+    statusMessage.value = 'Finalizing handshake...';
+
+    const responseFrame = JSON.parse(responseJson.value);
+    const symKey = await finalizeSenderHandshake(senderKeyPair.value, senderNonceBase64.value || '', responseFrame);
+
+    // Export symmetric key raw -> base64
+    const raw = await crypto.subtle.exportKey('raw', symKey);
+    const symKeyBase64 = arrayBufferToBase64(raw as ArrayBuffer);
+
+    statusMessage.value = 'Handshake complete — symmetric key derived.';
+    // Emit handshake-complete with symmetric key base64 attached
+    emit('handshake-complete', await exportPublicKeyBase64(senderKeyPair.value.publicKey), sessionId.value || '', symKeyBase64);
+  } catch (err) {
+    console.error('Finalize handshake failed:', err);
+    statusMessage.value = `Error finalizing handshake: ${String(err)}`;
+  } finally {
+    isFinalizing.value = false;
   }
 };
 </script>

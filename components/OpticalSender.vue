@@ -55,6 +55,12 @@
       <span v-else>⏳ Transferring... ({{ transferProgress }}%)</span>
     </button>
 
+    <!-- QR Code Display -->
+    <div v-if="isTransferring" class="bg-white rounded-lg p-4 border border-gray-300">
+      <h3 class="font-semibold mb-2">📱 Scanning QR</h3>
+      <canvas ref="canvasElement" width="300" height="300" class="w-full border-2 border-gray-300 rounded-lg mx-auto" />
+    </div>
+
     <!-- Block Queue Debug -->
     <div v-if="isTransferring" class="bg-gray-50 rounded-lg p-4 border border-gray-200">
       <h3 class="font-semibold mb-2">📊 Transfer Progress</h3>
@@ -77,20 +83,36 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed } from 'vue';
+import { ref, computed, onMounted, onUnmounted } from 'vue';
 import OpticalHandshake from './OpticalHandshake.vue';
-import { createBlocksFromFile, SendQueue } from '~/services/opticalBlockManager';
-import { encryptAESGCM, deriveSymmetricKey, deriveSharedSecret, importPublicKeyBase64, base64ToArrayBuffer } from '~/services/opticalCrypto';
+import { createEncryptedBlocksFromFile } from '~/services/opticalBlockManager';
+import { BlockStore } from '~/services/opticalDB';
+import { initializeSenderPipeline, sendBlockViaQR, sendBlockViaDataChannel, getSenderStats, pauseSender, resumeSender, stopSender } from '~/services/opticalSenderFlow';
+import type { SenderPipeline } from '~/services/opticalSenderFlow';
+import { fileDataSha256 } from '~/services/opticalAssembly';
 
 const fileInput = ref<HTMLInputElement>();
+const canvasElement = ref<HTMLCanvasElement>();
 const selectedFiles = ref<File[]>([]);
 const isDragging = ref(false);
 const isTransferring = ref(false);
 const handshakeComplete = ref(false);
 const transferProgress = ref(0);
-const sendQueue = ref<SendQueue>(new SendQueue());
+const senderPipeline = ref<SenderPipeline | null>(null);
+const symKey = ref<CryptoKey | null>(null);
+const ecdhPublicKeyBase64 = ref('');
+const blockStore = ref<BlockStore>(new BlockStore());
 
-const blockStats = computed(() => sendQueue.value.getProgress());
+const blockStats = computed(() => {
+  if (!senderPipeline.value) return { total: 0, sent: 0, completed: 0, failed: 0 };
+  const stats = getSenderStats(senderPipeline.value);
+  return {
+    total: stats.totalBlocks,
+    sent: Math.max(stats.blocksCompleted, stats.blocksFailed),
+    completed: stats.blocksCompleted,
+    failed: stats.blocksFailed,
+  };
+});
 
 const totalSize = computed(() => {
   return selectedFiles.value.reduce((sum, f) => sum + f.size, 0);
@@ -118,43 +140,60 @@ const handleDrop = (e: DragEvent) => {
   }
 };
 
-const onHandshakeComplete = (pubKey: string, sessionId: string) => {
+const onHandshakeComplete = (pubKey: string, sessionId: string, symKeyBase64?: string) => {
   handshakeComplete.value = true;
-  console.log('Handshake complete. Ready to transfer.', { pubKey, sessionId });
+  ecdhPublicKeyBase64.value = pubKey;
+  console.log('Handshake complete. Ready to transfer.', { pubKey, sessionId, symKeyBase64 });
 };
 
 const startTransfer = async () => {
+  if (!symKey.value) {
+    console.error('Symmetric key not available');
+    return;
+  }
+
   try {
     isTransferring.value = true;
 
-    for (const file of selectedFiles.value) {
-      const fileBuffer = await file.arrayBuffer();
-      const fileData = new Uint8Array(fileBuffer);
+    // Initialize pipeline
+    const pipeline = await initializeSenderPipeline(
+      selectedFiles.value,
+      symKey.value,
+      ecdhPublicKeyBase64.value,
+      blockStore.value
+    );
+    senderPipeline.value = pipeline;
 
-      // Create blocks (without encryption for now, will add in full implementation)
-      const blocks = await createBlocksFromFile(
-        crypto.getRandomValues(new Uint8Array(16)).toString(),
-        fileData,
-        1024
-      );
+    // Send blocks via QR (in demo, no DataChannel yet)
+    for (let i = 0; i < pipeline.blocks.length; i++) {
+      if (pipeline.isPaused || pipeline.isStopped) break;
 
-      for (const block of blocks) {
-        sendQueue.value.add(block);
+      const block = pipeline.blocks[i];
+      if (canvasElement.value) {
+        await sendBlockViaQR(block, canvasElement.value);
       }
 
-      // Simulate transfer
-      for (let i = 0; i < blocks.length; i++) {
-        await new Promise((resolve) => setTimeout(resolve, 100));
-        transferProgress.value = Math.round(((i + 1) / blocks.length) * 100);
-        sendQueue.value.markCompleted(i);
-      }
+      transferProgress.value = Math.round(((i + 1) / pipeline.blocks.length) * 100);
+      pipeline.tracker.markBlockCompleted();
     }
 
     console.log('Transfer complete!');
+    pipeline.tracker.setState('completed');
   } catch (error) {
     console.error('Transfer failed:', error);
+    if (senderPipeline.value) {
+      senderPipeline.value.tracker.setState('failed', String(error));
+    }
   } finally {
     isTransferring.value = false;
   }
 };
+
+onMounted(async () => {
+  await blockStore.value.initialize();
+});
+
+onUnmounted(() => {
+  blockStore.value.close();
+});
 </script>

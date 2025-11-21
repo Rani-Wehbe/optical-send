@@ -1,3 +1,123 @@
+import { decryptAESGCM } from './opticalCrypto';
+import { decompress } from './opticalCompression';
+import { BlockStore } from './opticalDB';
+/**
+ * Process a received block: decrypt, validate, decompress, store, and mark complete.
+ * If checksum fails, returns false (should enqueue retransmit).
+ */
+export async function processReceivedBlock(
+  block: BlockRecord,
+  symKey: CryptoKey,
+  blockStore: BlockStore
+): Promise<boolean> {
+  try {
+    // Decrypt (ensure ArrayBuffer, not SharedArrayBuffer)
+    const payloadCopy = new Uint8Array(block.payload.length);
+    payloadCopy.set(block.payload, 0);
+    const decrypted = await decryptAESGCM(
+      payloadCopy.buffer,
+      symKey,
+      block.header.iv
+    );
+    // Validate checksum
+    const checksum = await computeSHA256(decrypted);
+    if (checksum !== block.header.checksum) {
+      block.state = 'failed';
+      block.lastError = 'Checksum mismatch';
+      block.retransmitCount++;
+      return false;
+    }
+    // Decompress
+    const decompressed = await decompress(
+      new Uint8Array(decrypted),
+      block.header.compression
+    );
+    // Store in IndexedDB
+    // Ensure decompressed is a plain ArrayBuffer
+    const decompressedCopy = new Uint8Array(decompressed.length);
+    decompressedCopy.set(decompressed, 0);
+    const payloadCopy2 = new Uint8Array(block.payload.length);
+    payloadCopy2.set(block.payload, 0);
+    await blockStore.storeBlock({
+      fileId: block.fileId,
+      seq: block.seq,
+      header: JSON.stringify(block.header),
+      payload: payloadCopy2.buffer,
+      state: block.state,
+      decompressed: decompressedCopy.buffer,
+    });
+    block.state = 'completed';
+    block.verified = true;
+    return true;
+  } catch (err) {
+    block.state = 'failed';
+    block.lastError = String(err);
+    block.retransmitCount++;
+    return false;
+  }
+}
+import { encryptAESGCM, base64ToArrayBuffer } from './opticalCrypto';
+/**
+ * Create encrypted blocks from file data using AES-GCM and provided symmetric key.
+ * Each block is compressed, then encrypted with a random IV.
+ */
+export async function createEncryptedBlocksFromFile(
+  fileId: string,
+  fileData: Uint8Array,
+  symKey: CryptoKey,
+  blockSizeBytes: number = 1024
+): Promise<BlockRecord[]> {
+  const blocks: BlockRecord[] = [];
+  const totalBlocks = Math.ceil(fileData.length / blockSizeBytes);
+
+  for (let seq = 0; seq < totalBlocks; seq++) {
+    const start = seq * blockSizeBytes;
+    const end = Math.min(start + blockSizeBytes, fileData.length);
+    const blockData = fileData.slice(start, end);
+
+    const compressionResult = await selectBestCompression(blockData);
+    const comp = compressionResult.compressed;
+    const compCopy = new Uint8Array(comp.byteLength);
+    compCopy.set(comp, 0);
+    const checksum = await computeSHA256(compCopy.buffer);
+
+    // Encrypt compressed block
+    const encrypted = await encryptAESGCM(compCopy.buffer, symKey);
+
+    const header: BlockHeader = {
+      protocol: 'opticalsend-v1',
+      fileId,
+      blockId: uuidv4(),
+      seq,
+      totalSeq: totalBlocks,
+      payloadSize: encrypted.ciphertext.byteLength,
+      rawSize: blockData.length,
+      compression: compressionResult.type,
+      encryption: 'AES-GCM',
+      iv: encrypted.iv,
+      kdf: 'ECDH-P256',
+      checksum,
+      timestamp: new Date().toISOString(),
+    };
+
+    blocks.push({
+      id: header.blockId,
+      fileId,
+      seq,
+      totalSeq: totalBlocks,
+      header,
+      payload: new Uint8Array(encrypted.ciphertext),
+      state: 'pending',
+      attempts: 0,
+      sentOverQR: false,
+      sentOverWiFi: false,
+      verified: false,
+      retransmitCount: 0,
+    });
+  }
+
+  return blocks;
+}
 /**
  * OpticalBlockManager: Block creation, queueing, reassembly
  *
